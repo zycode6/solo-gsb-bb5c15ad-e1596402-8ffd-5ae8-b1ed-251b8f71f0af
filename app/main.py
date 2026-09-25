@@ -23,6 +23,7 @@ from .rehearsal import (
 )
 from .storage import PlanStore
 from .tour_packing import TourPackingError, pack_tour_books
+from .tour_stands import StandAction, StandChangeError, plan_stand_changes
 
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 DB_PATH = os.path.join(DATA_DIR, "plans.db")
@@ -854,6 +855,94 @@ class TourPackingResponse(BaseModel):
     )
 
 
+# ---------------------------------------- 巡演曲目单谱架换册
+
+
+class TourStandChangesRequest(BaseModel):
+    """巡演曲目单谱架换册请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_ids: List[str] = Field(
+        ...,
+        description="按演出顺序排列的已保存方案 ID（允许重复，1~500 项）；"
+        "每场需要对应的一册乐谱",
+    )
+    slot_count: int = Field(
+        ..., description="谱架槽位数（1~20 的严格整数），开场全部槽位为空"
+    )
+
+    @field_validator("plan_ids", mode="before")
+    @classmethod
+    def _reject_non_string_ids(cls, value: object) -> object:
+        """方案 ID 必须是字符串：拒绝数字/布尔/null 等非字符串元素。"""
+        if isinstance(value, list):
+            for plan_id in value:
+                if not isinstance(plan_id, str):
+                    raise ValueError(f"方案 ID 必须为字符串（收到 {plan_id!r}）")
+        return value
+
+    @field_validator("slot_count", mode="before")
+    @classmethod
+    def _reject_non_integer_slot_count(cls, value: object) -> object:
+        """槽位数必须是严格整数：拒绝 1.5 之类浮点（pydantic 默认会强转）与布尔。"""
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"谱架槽位数必须为整数（收到 {value!r}）")
+        return value
+
+    @model_validator(mode="after")
+    def _validate(self) -> "TourStandChangesRequest":
+        if len(self.plan_ids) < 1:
+            raise ValueError(
+                "演出场数（0）少于下限 1：一次巡演必须提交 1~500 场"
+            )
+        if len(self.plan_ids) > 500:
+            raise ValueError(
+                f"演出场数（{len(self.plan_ids)}）超过上限 500："
+                "一次巡演只能提交 1~500 场"
+            )
+        if not 1 <= self.slot_count <= 20:
+            raise ValueError(
+                f"谱架槽位数（{self.slot_count}）必须在 1~20 之间"
+            )
+        return self
+
+
+class StandActionOut(BaseModel):
+    """一次上架/撤下动作。"""
+
+    plan_id: str = Field(..., description="动作涉及的方案 ID")
+    slot: int = Field(..., description="动作发生的槽位编号（1 基）")
+
+
+class StandChangeShowOut(BaseModel):
+    """一场演出的换册明细。"""
+
+    show_index: int = Field(..., description="场次序号（1 基，按演出顺序）")
+    plan_id: str = Field(..., description="本场所需的方案 ID")
+    load: Optional[StandActionOut] = Field(
+        ..., description="上架动作；本场所需册已在架上时为 null"
+    )
+    unload: Optional[StandActionOut] = Field(
+        ..., description="撤下动作；有空槽或无需上架时为 null"
+    )
+    slots_after: List[Optional[str]] = Field(
+        ...,
+        description="本场换册后各槽位上的方案 ID（按槽位编号 1..k 顺序），"
+        "空槽为 null",
+    )
+
+
+class TourStandChangesResponse(BaseModel):
+    request: TourStandChangesRequest
+    slot_count: int = Field(..., description="谱架槽位数")
+    show_count: int = Field(..., description="演出场数")
+    total_loads: int = Field(..., description="总上架次数（最少）")
+    shows: List[StandChangeShowOut] = Field(
+        ..., description="按演出顺序的每场换册明细"
+    )
+
+
 # ---------------------------------------------------------------- 接口
 
 
@@ -1301,6 +1390,65 @@ def pack_tour_shipment(payload: TourPackingRequest) -> TourPackingResponse:
                 remaining_capacity=box.remaining_capacity,
             )
             for box in result.boxes
+        ],
+    )
+
+
+@app.post("/api/v1/tour/stand-changes", response_model=TourStandChangesResponse)
+def plan_tour_stand_changes(
+    payload: TourStandChangesRequest,
+) -> TourStandChangesResponse:
+    """为巡演曲目单规划谱架换册。
+
+    提交按演出顺序排列的 1~500 个已保存方案 ID（允许重复，每场需要对应的
+    一册乐谱）与 1~20 个谱架槽位：开场所有槽位为空，每册占一槽，每场所需
+    册须在架上。以总上架次数最少为目标逐场模拟：缺册时先用编号最小的空槽；
+    架满则撤下未来最晚再次使用的册（永不再用视为最晚，并列取方案 ID 字典
+    序最小者），再把所需册放上腾出的槽位。返回每场的上架/撤下动作、场后各
+    槽位方案 ID 与总上架次数。该接口只读取已保存方案，不写入新方案。
+    """
+    assert store is not None
+    missing: List[str] = []
+    checked: set[str] = set()
+    for plan_id in payload.plan_ids:
+        if plan_id in checked:
+            continue
+        checked.add(plan_id)
+        if store.get(plan_id) is None:
+            missing.append(plan_id)
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail="以下方案不存在，无法规划谱架换册：" + "、".join(missing),
+        )
+
+    try:
+        result = plan_stand_changes(
+            plan_ids=payload.plan_ids, slot_count=payload.slot_count
+        )
+    except StandChangeError as exc:
+        # 场数/槽位数/ID 类型等已在请求层拦截；此处为兜底语义错误
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def _action_out(action: Optional[StandAction]) -> Optional[StandActionOut]:
+        if action is None:
+            return None
+        return StandActionOut(plan_id=action.plan_id, slot=action.slot)
+
+    return TourStandChangesResponse(
+        request=payload,
+        slot_count=result.slot_count,
+        show_count=len(result.shows),
+        total_loads=result.total_loads,
+        shows=[
+            StandChangeShowOut(
+                show_index=show.show_index,
+                plan_id=show.plan_id,
+                load=_action_out(show.load),
+                unload=_action_out(show.unload),
+                slots_after=show.slots_after,
+            )
+            for show in result.shows
         ],
     )
 
